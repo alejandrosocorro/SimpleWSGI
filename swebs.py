@@ -1,8 +1,7 @@
 import os
 import sys
-import time
 import socket
-import StringIO
+import datetime
 
 
 class SimpleWSGI(object):
@@ -10,6 +9,7 @@ class SimpleWSGI(object):
     address_family = socket.AF_INET
     socket_type = socket.SOCK_STREAM
     request_queue_size = 1
+    enc, esc = sys.getfilesystemencoding(), 'surrogateescape'
 
     def __init__(self, server_address):
         # Create listening socket
@@ -53,7 +53,7 @@ class SimpleWSGI(object):
         # Call oapplication callable
         result = self.application(env, self.start_response)
         # Construct a response and send it back to the client
-        self.response(result)
+        self.start_response(result)
 
     def parse_request(self, text):
         request_line = text.splitlines()[0]
@@ -63,11 +63,18 @@ class SimpleWSGI(object):
          self.request_version  # HTTP/1.1
          ) = request_line.split()
 
+    def unicode_to_wsgi(u):
+        # Convert an environment variable to a WSGI "bytes-as-unicode" string
+        return u.encode(enc, esc).decode('iso-8859-1')
+
+    def wsgi_to_bytes(s):
+        return s.encode('iso-8859-1')
+
     def get_environ(self):
         environ = dict(os.environ.items())
         environ['wsgi.version']      = (1, 0)
         #environ['wsgi.input']        = sys.stdin
-        environ['wsgi.input']        = StringIO.StringIO(self.request_data),
+        environ['wsgi.input']        = self.request_data,
         environ['wsgi.errors']       = sys.stderr
         environ['wsgi.version']      = (1, 0)
         environ['wsgi.multithread']  = False
@@ -85,12 +92,43 @@ class SimpleWSGI(object):
 
         return env
 
+    def start_response(self, status, response_headers, exc_info=None):
+        # Add necessary server headers
+        date = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        server_headers = [
+            ('Date', datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+            ('Server', 'SimpleWSGI 0.1'),
+        ]
+        self.headers_set = [status, response_headers + server_headers]
+        # To adhere to WSGI specification the start_response must return
+        # a 'write' callable. We simplicity's sake we'll ignore that detail
+        # for now.
+        # return self.finish_response
+
+    def finish_response(self, result):
+        try:
+            status, response_headers = self.headers_set
+            response = 'HTTP/1.1 {status}\r\n'.format(status=status)
+            for header in response_headers:
+                response += '{0}: {1}\r\n'.format(*header)
+            response += '\r\n'
+            for data in result:
+                response += data
+            # Print formatted response data a la 'curl -v'
+            print(''.join(
+                '> {line}\n'.format(line=line)
+                for line in response.splitlines()
+            ))
+            self.client_connection.sendall(response)
+        finally:
+            self.client_connection.close()
+
 
 SERVER_ADDRESS = (HOST, PORT) = '', 8888
 
 
-def make_server(server_address, application):
-    server = WSGIServer(server_address)
+def setup_server(server_address, application):
+    server = SimpleWSGI(server_address)
     server.set_app(application)
     return server
 
@@ -98,10 +136,12 @@ def make_server(server_address, application):
 if __name__ == '__main__':
     if len(sys.argv) < 2:
         sys.exit('Provide a WSGI application object as module:callable')
+
     app_path = sys.argv[1]
     module, application = app_path.split(':')
     module = __import__(module)
     application = getattr(module, application)
-    httpd = make_server(SERVER_ADDRESS, application)
+
+    httpd = setup_server(SERVER_ADDRESS, application)
     print('SimpleWSGI: Serving HTTP on port {port} ...\n'.format(port=PORT))
     httpd.serve()
